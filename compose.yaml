@@ -1,13 +1,29 @@
 services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: vipbot
+      POSTGRES_USER: vipbot
+      POSTGRES_PASSWORD: local-development-only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vipbot -d vipbot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
   bot:
     build: .
     restart: unless-stopped
     init: true
-    env_file: .env
+    env_file: .env.local
     environment:
-      DATABASE_PATH: /app/data/bot.sqlite3
-    volumes:
-      - bot_data:/app/data
+      DATABASE_URL: postgresql://vipbot:local-development-only@postgres:5432/vipbot
+    depends_on:
+      postgres:
+        condition: service_healthy
     security_opt:
       - no-new-privileges:true
     logging:
@@ -17,4 +33,4 @@ services:
         max-file: "3"
 
 volumes:
-  bot_data:
+  postgres_data:

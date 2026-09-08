@@ -3,10 +3,8 @@
 import asyncio
 import json
 import re
-import sqlite3
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 PARIS = ZoneInfo("Europe/Paris")
@@ -119,25 +117,53 @@ class State:
 
 
 class Store:
-    def __init__(self, path):
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path)
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=FULL")
-        self.db.execute("CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL)")
-        row = self.db.execute("SELECT value FROM state WHERE id=1").fetchone()
-        self.state = State(**json.loads(row[0])) if row else State()
+    """État PostgreSQL JSONB. Une connexion courte est utilisée par opération."""
+
+    def __init__(self, database_url, connector=None):
+        if not database_url:
+            raise ValueError("DATABASE_URL est vide.")
+        if connector is None:
+            import psycopg
+            connector = psycopg.connect
+        self.database_url = database_url
+        self.connector = connector
+        with self.connector(self.database_url, connect_timeout=10) as db:
+            with db.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS bot_state (
+                        id SMALLINT PRIMARY KEY CHECK (id = 1),
+                        value JSONB NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute("SELECT value FROM bot_state WHERE id = 1")
+                row = cursor.fetchone()
+        if row:
+            value = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+            self.state = State(**value)
+        else:
+            self.state = State()
         self.save()
 
     def save(self):
-        with self.db:
-            self.db.execute(
-                "INSERT INTO state VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET value=excluded.value",
-                (json.dumps(asdict(self.state), ensure_ascii=False),),
-            )
+        value = json.dumps(asdict(self.state), ensure_ascii=False)
+        with self.connector(self.database_url, connect_timeout=10) as db:
+            with db.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO bot_state (id, value, updated_at)
+                    VALUES (1, %s::jsonb, NOW())
+                    ON CONFLICT (id) DO UPDATE
+                    SET value = EXCLUDED.value, updated_at = NOW()
+                    """,
+                    (value,),
+                )
 
     def close(self):
-        self.db.close()
+        # Les connexions sont déjà fermées à la fin de chaque opération.
+        pass
 
 
 class Engine:

@@ -325,7 +325,17 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     for name in ("httpx", "httpcore", "apscheduler"):
         logging.getLogger(name).setLevel(logging.WARNING)
-    store = Store(os.getenv("DATABASE_PATH", str(Path(__file__).parent / "data" / "bot.sqlite3")))
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    if not database_url or database_url == "${{Postgres.DATABASE_URL}}":
+        raise SystemExit(
+            "Renseignez DATABASE_URL. Sur Railway, utilisez la référence ${{Postgres.DATABASE_URL}} "
+            "dans les variables du service du bot."
+        )
+    try:
+        store = Store(database_url)
+    except Exception as error:
+        LOG.error("Connexion PostgreSQL impossible : %s", type(error).__name__)
+        raise SystemExit("Connexion PostgreSQL impossible. Vérifiez DATABASE_URL et le service Postgres.") from None
     app = build_application(token, admin_ids, store)
     app.run_polling(allowed_updates=["message", "callback_query", "my_chat_member"], drop_pending_updates=False)
 
