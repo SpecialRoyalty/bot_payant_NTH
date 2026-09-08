@@ -94,6 +94,27 @@ def countdown_text(hours):
     return f"Le groupe ouvrira dans {hours} {suffix}."
 
 
+def parse_group_id(value):
+    """Valide un ID numérique Telegram de groupe/supergroupe."""
+    value = value.strip()
+    if not re.fullmatch(r"-[1-9][0-9]{0,18}", value):
+        raise ValueError("Envoyez l’ID numérique négatif du groupe, par exemple -1001234567890.")
+    return int(value)
+
+
+def next_opening_boundary(now):
+    """Prochaine heure utile du cycle d'ouverture, exprimée en UTC."""
+    local = now.astimezone(PARIS)
+    hour = local.replace(minute=0, second=0, microsecond=0)
+    if 1 <= local.hour < 21:
+        target = hour + timedelta(hours=1)
+    elif local.hour >= 21:
+        target = (hour + timedelta(days=1)).replace(hour=1)
+    else:
+        target = hour.replace(hour=1)
+    return target.astimezone(timezone.utc)
+
+
 @dataclass
 class State:
     group_id: int | None = None
@@ -111,13 +132,14 @@ class State:
     opening_message: dict | None = None
     opening_group_closed: bool = False
     opening_saved_permissions: dict | None = None
+    detected_groups: list = field(default_factory=list)
     service_deletions: list = field(default_factory=list)
     errors: dict = field(default_factory=dict)
     retry_at: dict = field(default_factory=dict)
 
 
 class Store:
-    """État PostgreSQL JSONB. Une connexion courte est utilisée par opération."""
+    """État PostgreSQL JSONB, sans écriture si le contenu n'a pas changé."""
 
     def __init__(self, database_url, connector=None):
         if not database_url:
@@ -127,39 +149,74 @@ class Store:
             connector = psycopg.connect
         self.database_url = database_url
         self.connector = connector
-        with self.connector(self.database_url, connect_timeout=10) as db:
-            with db.cursor() as cursor:
-                cursor.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS bot_state (
-                        id SMALLINT PRIMARY KEY CHECK (id = 1),
-                        value JSONB NOT NULL,
-                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        self.connected = False
+        self._last_saved_value = None
+        try:
+            with self.connector(self.database_url, connect_timeout=10) as db:
+                with db.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS bot_state (
+                            id SMALLINT PRIMARY KEY CHECK (id = 1),
+                            value JSONB NOT NULL,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        )
+                        """
                     )
-                    """
-                )
-                cursor.execute("SELECT value FROM bot_state WHERE id = 1")
-                row = cursor.fetchone()
+                    cursor.execute("SELECT value FROM bot_state WHERE id = 1")
+                    row = cursor.fetchone()
+            self.connected = True
+        except Exception:
+            self.connected = False
+            raise
         if row:
             value = json.loads(row[0]) if isinstance(row[0], str) else row[0]
             self.state = State(**value)
+            self._last_saved_value = self._serialize()
         else:
             self.state = State()
-        self.save()
+            self.save()
+
+    def _serialize(self):
+        return json.dumps(asdict(self.state), ensure_ascii=False, sort_keys=True)
 
     def save(self):
-        value = json.dumps(asdict(self.state), ensure_ascii=False)
-        with self.connector(self.database_url, connect_timeout=10) as db:
-            with db.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO bot_state (id, value, updated_at)
-                    VALUES (1, %s::jsonb, NOW())
-                    ON CONFLICT (id) DO UPDATE
-                    SET value = EXCLUDED.value, updated_at = NOW()
-                    """,
-                    (value,),
-                )
+        value = self._serialize()
+        if value == self._last_saved_value:
+            return False
+        try:
+            with self.connector(self.database_url, connect_timeout=10) as db:
+                with db.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO bot_state (id, value, updated_at)
+                        VALUES (1, %s::jsonb, NOW())
+                        ON CONFLICT (id) DO UPDATE
+                        SET value = EXCLUDED.value, updated_at = NOW()
+                        """,
+                        (value,),
+                    )
+            self.connected = True
+            self._last_saved_value = value
+            return True
+        except Exception:
+            self.connected = False
+            raise
+
+    def check(self):
+        """Effectue une vraie requête, utilisée par le bouton de diagnostic."""
+        try:
+            with self.connector(self.database_url, connect_timeout=10) as db:
+                with db.cursor() as cursor:
+                    cursor.execute("SELECT 1")
+                    row = cursor.fetchone()
+            if not row or row[0] != 1:
+                raise RuntimeError("Réponse PostgreSQL invalide")
+            self.connected = True
+            return True
+        except Exception:
+            self.connected = False
+            raise
 
     def close(self):
         # Les connexions sont déjà fermées à la fin de chaque opération.
@@ -167,8 +224,9 @@ class Store:
 
 
 class Engine:
-    def __init__(self, store, bot):
+    def __init__(self, store, bot, wake_scheduler=None):
         self.store, self.bot = store, bot
+        self.wake_scheduler = wake_scheduler
         self.lock = asyncio.Lock()
 
     @property
@@ -176,7 +234,10 @@ class Engine:
         return self.store.state
 
     def save(self):
-        self.store.save()
+        changed = self.store.save()
+        if changed and self.wake_scheduler:
+            self.wake_scheduler()
+        return changed
 
     def ready(self):
         s = self.state
@@ -242,10 +303,19 @@ class Engine:
             )
         return chat
 
+    def remember_detected_group(self, chat):
+        """Mémorise au plus huit groupes vérifiés pour les proposer en boutons."""
+        title = chat.title or str(chat.id)
+        entry = {"id": chat.id, "title": title[:80]}
+        groups = [item for item in self.state.detected_groups
+                  if isinstance(item, dict) and item.get("id") != chat.id]
+        self.state.detected_groups = [entry, *groups][:8]
+
     async def connect(self, chat, now):
         s = self.state
         if s.group_id == chat.id:
             s.group_title = chat.title or str(chat.id)
+            self.remember_detected_group(chat)
             self.save()
             return
         # Ne jamais abandonner l'ancien groupe fermé lors d'un changement.
@@ -260,6 +330,7 @@ class Engine:
         if not await self.remove_tracked("ad_message", "publicité", now):
             raise ValueError("Impossible de supprimer l’ancienne publicité. Rétablissez les droits dans l’ancien groupe puis réessayez.")
         s.group_id, s.group_title = chat.id, chat.title or str(chat.id)
+        self.remember_detected_group(chat)
         s.ad_enabled = s.opening_enabled = False
         s.next_ad_at = 0
         s.opening_last_date = ""
@@ -441,3 +512,38 @@ class Engine:
                         break
                     s.service_deletions.remove(ref)
                     self.save()
+
+    def next_wakeup_at(self, now=None):
+        """Calcule la prochaine échéance pour éviter toute boucle périodique."""
+        now = now or utc_now()
+        now_ts = now.timestamp()
+        s = self.state
+        due = []
+
+        if s.opening_enabled and s.group_id:
+            slot = opening_slot(now)
+            if slot is None:
+                inconsistent = bool(
+                    s.opening_group_closed or s.opening_message
+                    or s.opening_saved_permissions is not None
+                )
+            else:
+                inconsistent = bool(
+                    not s.opening_group_closed or not s.opening_message
+                    or s.opening_last_slot != slot[0]
+                )
+            if inconsistent:
+                due.append(max(now_ts, s.retry_at.get("ouverture", 0)))
+            due.append(next_opening_boundary(now).timestamp())
+        elif s.opening_group_closed or s.opening_message or s.opening_saved_permissions is not None:
+            due.append(max(now_ts, s.retry_at.get("ouverture", 0)))
+
+        if s.ad_enabled and self.ready():
+            due.append(max(now_ts, s.next_ad_at, s.retry_at.get("publicité", 0)))
+        elif s.ad_message:
+            due.append(max(now_ts, s.retry_at.get("publicité", 0)))
+
+        if s.service_deletions:
+            due.append(max(now_ts, s.retry_at.get("entrées/sorties", 0)))
+
+        return min(due) if due else None

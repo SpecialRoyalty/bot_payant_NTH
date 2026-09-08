@@ -1,8 +1,10 @@
 """Bot Telegram : panneau privé à boutons, un seul groupe, accès par IDs."""
 
+import asyncio
 import logging
 import os
 import secrets
+from contextlib import suppress
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -27,7 +29,7 @@ from telegram.ext import (
 
 from engine import (
     Engine, PARIS, Store, TelegramError as EngineError, has_admin_access,
-    normalize_username, parse_admin_ids, utc_now, validate_caption,
+    normalize_username, parse_admin_ids, parse_group_id, utc_now, validate_caption,
 )
 from gateway import TelegramGateway
 
@@ -68,7 +70,27 @@ class AdminUI:
         rows.extend([
             [Button(f"{'🟢' if s.opening_enabled else '🔴'} Ouverture : {'ON' if s.opening_enabled else 'OFF'}",
                     callback_data=f"opening:{0 if s.opening_enabled else 1}")],
+            [Button("🗄 Vérifier PostgreSQL", callback_data="db_check")],
             [Button("🔄 Actualiser le panneau", callback_data="home")],
+        ])
+        return Markup(rows)
+
+    def group_menu(self, bot_username):
+        s = self.engine.state
+        rows = [[Button(
+            "➕ Ajouter le bot au groupe",
+            url=f"https://t.me/{bot_username}?startgroup=connect&admin=delete_messages+restrict_members",
+        )]]
+        for item in s.detected_groups[:8]:
+            if not isinstance(item, dict) or not isinstance(item.get("id"), int):
+                continue
+            prefix = "✅" if item["id"] == s.group_id else "📍"
+            title = str(item.get("title") or item["id"])
+            rows.append([Button(f"{prefix} {title}"[:60], callback_data=f"group_pick:{item['id']}")])
+        rows.extend([
+            [Button("✍️ Ajouter avec l’ID", callback_data="manual_group")],
+            [Button("👥 Sélecteur Telegram", callback_data="choose_group")],
+            [Button("⬅️ Retour", callback_data="home")],
         ])
         return Markup(rows)
 
@@ -81,6 +103,7 @@ class AdminUI:
         text = (
             "⚙️ PANNEAU ADMIN\n\n"
             f"Groupe : {s.group_title or 'non connecté'}\n"
+            f"PostgreSQL : {'✅ connecté' if self.engine.store.connected else '❌ indisponible'}\n"
             f"Photo : {'✅' if s.photo_id else 'à configurer'}\n"
             f"Texte : {'✅' if s.text else 'à configurer'}\n"
             f"VIP : {'@' + s.vip_username if s.vip_username else 'à configurer'}\n\n"
@@ -110,6 +133,30 @@ class AdminUI:
         )
 
     async def start(self, update, context):
+        if update.effective_chat and update.effective_chat.type in ("group", "supergroup"):
+            user = update.effective_user
+            if not user or user.id not in self.admin_ids:
+                return
+            notice = ""
+            try:
+                async with self.engine.lock:
+                    chat = await self.engine.require_group_rights(update.effective_chat.id, user.id)
+                    await self.engine.connect(chat, utc_now())
+                notice = "✅ Groupe détecté et connecté automatiquement."
+            except ValueError as error:
+                notice = f"⚠️ {error}"
+            except (TelegramError, EngineError):
+                notice = "⚠️ Telegram refuse l’accès au groupe. Vérifiez les deux droits du bot."
+            except Exception as error:
+                LOG.error("Connexion groupe impossible : %s", type(error).__name__)
+                notice = "❌ Connexion impossible. Vérifiez PostgreSQL dans le panneau."
+            with suppress(TelegramError):
+                await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
+            with suppress(TelegramError):
+                await context.bot.send_message(
+                    chat_id=user.id, text=self.panel_text(notice), reply_markup=self.menu(),
+                )
+            return
         if not await self.guard(update):
             return
         context.user_data.clear()
@@ -126,20 +173,17 @@ class AdminUI:
         context.user_data.clear()
         if action == "group":
             await query.edit_message_text(
-                "1. Ajoutez le bot au groupe avec le bouton ci-dessous.\n"
-                "2. Donnez-lui les droits « Supprimer les messages » et « Restreindre les membres ».\n"
-                "3. Revenez ici et appuyez sur « Choisir le groupe ».\n\n"
-                "Vous devez être administrateur du groupe. Un changement de groupe arrête les deux automatismes.",
-                reply_markup=Markup([
-                    [Button("➕ Ajouter le bot au groupe", url=f"https://t.me/{context.bot.username}?startgroup=connect&admin=delete_messages+restrict_members")],
-                    [Button("👥 Choisir le groupe", callback_data="choose_group")],
-                    [Button("⬅️ Retour", callback_data="home")],
-                ]),
+                "Ajoutez le bot comme administrateur avec les droits « Supprimer les messages » et "
+                "« Restreindre les membres ». Le groupe sera détecté et connecté automatiquement.\n\n"
+                "Les groupes détectés apparaissent ci-dessous. Si Telegram ne les affiche pas, utilisez "
+                "« Ajouter avec l’ID » ou envoyez /start dans le groupe.\n\n"
+                "Vous devez être administrateur du groupe. Changer de groupe arrête les deux automatismes.",
+                reply_markup=self.group_menu(context.bot.username),
             )
             return
         if action == "choose_group":
             request_id = secrets.randbelow(2**31 - 1) + 1
-            context.user_data.update(mode="group", request_id=request_id)
+            context.user_data.update(mode="group_share", request_id=request_id)
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text="Appuyez sur le bouton « Sélectionner mon groupe » sous le champ de saisie.",
@@ -149,6 +193,14 @@ class AdminUI:
                     ))],
                     [KeyboardButton("⬅️ Annuler")],
                 ], resize_keyboard=True, one_time_keyboard=True),
+            )
+            return
+        if action == "manual_group":
+            context.user_data["mode"] = "group_id"
+            await query.edit_message_text(
+                "Envoyez l’ID numérique négatif du groupe, par exemple -1001234567890.\n\n"
+                "Le bot doit déjà être administrateur de ce groupe avec les deux droits requis.",
+                reply_markup=Markup([[Button("⬅️ Annuler", callback_data="home")]]),
             )
             return
         prompts = {
@@ -194,10 +246,21 @@ class AdminUI:
                             if ok else
                             "🔴 Cycle désactivé. Réouverture ou suppression en attente ; vérifiez les droits du bot."
                         )
+                elif action.startswith("group_pick:"):
+                    chat_id = parse_group_id(action.removeprefix("group_pick:"))
+                    chat = await self.engine.require_group_rights(chat_id, update.effective_user.id)
+                    await self.engine.connect(chat, utc_now())
+                    notice = "✅ Groupe connecté depuis la liste détectée."
+                elif action == "db_check":
+                    await asyncio.to_thread(self.engine.store.check)
+                    notice = "✅ PostgreSQL répond correctement et l’état du bot est accessible."
         except ValueError as error:
             notice = str(error)
         except (TelegramError, EngineError):
             notice = "Telegram refuse l’action ou ne répond pas. Vérifiez les droits du bot puis réessayez."
+        except Exception as error:
+            LOG.error("Action admin impossible : %s", type(error).__name__)
+            notice = "❌ PostgreSQL ne répond pas. Vérifiez DATABASE_URL et le service Postgres sur Railway."
         await self.panel(update, notice, edit=True)
 
     async def receive(self, update, context):
@@ -215,13 +278,18 @@ class AdminUI:
         try:
             async with self.engine.lock:
                 s = self.engine.state
-                if mode == "group":
+                if mode == "group_share":
                     shared = message.chat_shared
                     if not shared or shared.request_id != context.user_data.get("request_id"):
                         raise ValueError("Utilisez le bouton « Sélectionner mon groupe » sous le champ de saisie.")
                     chat = await self.engine.require_group_rights(shared.chat_id, update.effective_user.id)
                     await self.engine.connect(chat, utc_now())
                     notice = "✅ Groupe connecté. Configurez la publicité puis appuyez sur « Publier / actualiser »."
+                elif mode == "group_id":
+                    chat_id = parse_group_id(message.text or "")
+                    chat = await self.engine.require_group_rights(chat_id, update.effective_user.id)
+                    await self.engine.connect(chat, utc_now())
+                    notice = "✅ Groupe connecté manuellement."
                 elif mode == "photo":
                     if not message.photo:
                         raise ValueError("Envoyez une photo, pas un fichier ou du texte.")
@@ -246,6 +314,10 @@ class AdminUI:
                 "les messages et de restreindre les membres, puis réessayez."
             )
             return
+        except Exception as error:
+            LOG.error("Enregistrement impossible : %s", type(error).__name__)
+            await message.reply_text("PostgreSQL ne répond pas. Vérifiez DATABASE_URL sur Railway.")
+            return
         context.user_data.clear()
         await message.reply_text(notice, reply_markup=ReplyKeyboardRemove())
         await self.panel(update)
@@ -268,39 +340,92 @@ class AdminUI:
         event = update.my_chat_member
         if not event or event.chat.type not in ("group", "supergroup", "channel"):
             return
-        before, after = event.old_chat_member, event.new_chat_member
-        was_in = before.status in ("member", "administrator", "creator") or (
-            before.status == "restricted" and before.is_member
-        )
+        after = event.new_chat_member
         is_in = after.status in ("member", "administrator", "creator") or (
             after.status == "restricted" and after.is_member
         )
-        # Une personne extérieure à ADMIN_IDS ne peut installer le bot dans son groupe.
-        if not was_in and is_in and (event.from_user.id not in self.admin_ids or event.chat.type == "channel"):
+        if event.chat.type == "channel":
             await context.bot.leave_chat(event.chat.id)
+            return
+        # Un ajout extérieur ne donne aucun contrôle. Un admin autorisé pourra ensuite
+        # connecter explicitement le groupe par le panneau ou avec /start dans le groupe.
+        if not is_in or event.from_user.id not in self.admin_ids:
+            return
+        try:
+            async with self.engine.lock:
+                chat = await self.engine.require_group_rights(event.chat.id, event.from_user.id)
+                if not self.engine.state.group_id or self.engine.state.group_id == chat.id:
+                    await self.engine.connect(chat, utc_now())
+                    notice = "✅ Groupe détecté et connecté automatiquement."
+                else:
+                    self.engine.remember_detected_group(chat)
+                    self.engine.save()
+                    notice = "📍 Groupe détecté. Choisissez-le dans « Connecter / changer de groupe »."
+        except ValueError as error:
+            notice = f"⚠️ Groupe détecté, mais non connecté : {error}"
+        except (TelegramError, EngineError):
+            notice = "⚠️ Groupe détecté, mais Telegram refuse la vérification des droits."
+        except Exception as error:
+            LOG.error("Détection groupe impossible : %s", type(error).__name__)
+            notice = "❌ Groupe détecté, mais PostgreSQL ne répond pas."
+        with suppress(TelegramError):
+            await context.bot.send_message(
+                chat_id=event.from_user.id, text=self.panel_text(notice), reply_markup=self.menu(),
+            )
 
 
 def build_application(token, admin_ids, store):
+    wake_scheduler = asyncio.Event()
+
+    async def automation_loop():
+        while True:
+            try:
+                await engine.tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                LOG.error("Automatisation temporairement indisponible : %s", type(error).__name__)
+                wake_scheduler.clear()
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(wake_scheduler.wait(), timeout=60)
+                continue
+
+            next_at = engine.next_wakeup_at()
+            wake_scheduler.clear()
+            if next_at is None:
+                await wake_scheduler.wait()
+                continue
+            delay = max(0.05, next_at - utc_now().timestamp())
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(wake_scheduler.wait(), timeout=delay)
+
     async def startup(app):
         await app.bot.set_my_commands([])
-        # Toutes les 5 s : reprise durable et heures de Paris sans dépendre du fuseau serveur.
-        app.job_queue.run_repeating(tick, interval=5, first=1, name="automatisations",
-                                    job_kwargs={"max_instances": 1, "coalesce": True})
+        app.bot_data["automation_task"] = asyncio.create_task(
+            automation_loop(), name="automatisations",
+        )
+        LOG.info("PostgreSQL connecté ; table bot_state prête.")
         LOG.info("Bot démarré ; panneau disponible en privé.")
-
-    async def tick(context):
-        await engine.tick()
 
     async def error_handler(update, context):
         # Ne jamais journaliser les URL HTTP contenant le token ni les messages privés.
         LOG.error("Erreur non traitée : %s", type(context.error).__name__)
 
+    async def stop_automations(app):
+        task = app.bot_data.get("automation_task")
+        if task:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
     async def shutdown(app):
         store.close()
 
     app = (Application.builder().token(token).concurrent_updates(False)
-           .post_init(startup).post_shutdown(shutdown).build())
-    engine = Engine(store, TelegramGateway(app.bot))
+           .connection_pool_size(4).get_updates_connection_pool_size(1)
+           .get_updates_read_timeout(60)
+           .post_init(startup).post_stop(stop_automations).post_shutdown(shutdown).build())
+    engine = Engine(store, TelegramGateway(app.bot), wake_scheduler.set)
     ui = AdminUI(engine, admin_ids)
     app.bot_data["engine"] = engine
     app.add_handler(CommandHandler("start", ui.start))
@@ -323,7 +448,7 @@ def main():
     except ValueError as error:
         raise SystemExit(str(error)) from error
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    for name in ("httpx", "httpcore", "apscheduler"):
+    for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)
     database_url = os.getenv("DATABASE_URL", "").strip()
     if not database_url or database_url == "${{Postgres.DATABASE_URL}}":
@@ -337,7 +462,11 @@ def main():
         LOG.error("Connexion PostgreSQL impossible : %s", type(error).__name__)
         raise SystemExit("Connexion PostgreSQL impossible. Vérifiez DATABASE_URL et le service Postgres.") from None
     app = build_application(token, admin_ids, store)
-    app.run_polling(allowed_updates=["message", "callback_query", "my_chat_member"], drop_pending_updates=False)
+    app.run_polling(
+        timeout=50,
+        allowed_updates=["message", "callback_query", "my_chat_member"],
+        drop_pending_updates=False,
+    )
 
 
 if __name__ == "__main__":
